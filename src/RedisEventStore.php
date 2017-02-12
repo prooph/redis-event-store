@@ -133,39 +133,33 @@ final class RedisEventStore implements TransactionalEventStore
         MetadataMatcher $metadataMatcher = null
     ): Iterator {
         $streamNameKey = $this->persistenceStrategy->getEventStreamHashKey($streamName); // fixme
-        $result = new \ArrayIterator();
 
         $fromNumber--;
-        $toNumber = $count ? $fromNumber + $count : -1;
+        $toNumber = $count ? $fromNumber + $count - 1 : -1;
 
-        // todo: is $fromNumber = 1 the aggregate version = 1 or the first event?
         $eventDataKeys = $this->redisClient->zRange('event_version:' . $streamNameKey, $fromNumber, $toNumber);
 
         if (! $eventDataKeys) {
-            return $result;
+            return;
         }
 
+        // todo: use persistence strategy
         foreach ($this->redisClient->mget($eventDataKeys) as $eventKey => $eventData) {
             if (false === $eventData) {
-                // todo: data for key was not found. Throw an exception?
-                throw new RuntimeException();
-                continue;
+                throw new RuntimeException(); // todo: provide excepion message
             }
 
             $eventData = json_decode($eventData, true);
 
-            // todo: maybe yielding values is better here
-            $result->append($this->messageFactory->createMessageFromArray($eventData['event_name'], [
+            yield $this->messageFactory->createMessageFromArray($eventData['event_name'], [
                 'uuid' => $eventData['event_id'],
                 'created_at' => \DateTimeImmutable::createFromFormat('Y-m-d\TH:i:s.u', $eventData['created_at']),
                 'payload' => json_decode($eventData['payload'], true),
                 'metadata' => json_decode($eventData['metadata'], true),
-            ]));
+            ]);
         }
 
         // todo: implement metadata matcher
-
-        return $result;
     }
 
     public function loadReverse(
@@ -174,40 +168,7 @@ final class RedisEventStore implements TransactionalEventStore
         int $count = null,
         MetadataMatcher $metadataMatcher = null
     ): Iterator {
-        $streamNameKey = $this->persistenceStrategy->getEventStreamHashKey($streamName); // fixme
-        $result = new \ArrayIterator();
-
-        $fromNumber = -1 * $fromNumber;
-        $toNumber = $count ? $fromNumber - $count : 0;
-
-        // todo: is $fromNumber = 1 the aggregate version = 1 or the first event?
-        $eventDataKeys = $this->redisClient->zRevRange('event_version:' . $streamNameKey, $fromNumber, (int) $toNumber);
-
-        if (! $eventDataKeys) {
-            return $result;
-        }
-
-        foreach ($this->redisClient->mget($eventDataKeys) as $eventKey => $eventData) {
-            if (false === $eventData) {
-                // todo: data for key was not found. Throw an exception?
-                throw new RuntimeException();
-                continue;
-            }
-
-            $eventData = json_decode($eventData, true);
-
-            // todo: maybe yielding values is better here
-            $result->append($this->messageFactory->createMessageFromArray($eventData['event_name'], [
-                'uuid' => $eventData['event_id'],
-                'created_at' => \DateTimeImmutable::createFromFormat('Y-m-d\TH:i:s.u', $eventData['created_at']),
-                'payload' => json_decode($eventData['payload'], true),
-                'metadata' => json_decode($eventData['metadata'], true),
-            ]));
-        }
-
-        // todo: implement metadata matcher
-
-        return $result;
+        throw new RuntimeException('not implemented yet');
     }
 
     public function delete(StreamName $streamName): void
