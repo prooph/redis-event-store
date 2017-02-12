@@ -1,8 +1,19 @@
-<?php declare(strict_types = 1);
+<?php
+/**
+ * This file is part of the prooph/redis-event-store.
+ * (c) 2017 prooph software GmbH <contact@prooph.de>
+ * (c) 2017 Sascha-Oliver Prolic <saschaprolic@googlemail.com>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+declare(strict_types=1);
 
 namespace ProophTest\EventStore\Redis;
 
 use ArrayIterator;
+use PHPUnit\Framework\TestCase;
 use Prooph\Common\Messaging\NoOpMessageConverter;
 use Prooph\EventStore\Redis\RedisEventStore;
 use Prooph\EventStore\Stream;
@@ -10,7 +21,6 @@ use Prooph\EventStore\StreamName;
 use ProophTest\EventStore\Mock\UserCreated;
 use ProophTest\EventStore\Mock\UsernameChanged;
 use Redis;
-use PHPUnit\Framework\TestCase;
 
 final class RedisEventStoreTest extends TestCase
 {
@@ -23,7 +33,7 @@ final class RedisEventStoreTest extends TestCase
     protected function setUp(): void
     {
         $this->redisClient = new Redis();
-        $this->redisClient->connect('0.0.0.0');
+        $this->redisClient->connect(getenv('REDIS_HOST'), (int) getenv('REDIS_PORT'));
         $this->redisClient->setOption(Redis::OPT_PREFIX, 'proophTest:');
 
         $this->eventStore = new RedisEventStore($this->redisClient);
@@ -33,7 +43,6 @@ final class RedisEventStoreTest extends TestCase
     {
         $this->redisClient->flushDB();
     }
-
 
     /**
      * @test
