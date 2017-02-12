@@ -49,6 +49,7 @@
     "scripts": {
         "cs": "vendor/bin/php-cs-fixer fix -v --diff --dry-run",
         "cs-fix": "vendor/bin/php-cs-fixer fix -v --diff",
-        "tests": "vendor/bin/phpunit"
+        "tests": "vendor/bin/phpunit",
+        "test-unit": "vendor/bin/phpunit --group unit"
     }
 }

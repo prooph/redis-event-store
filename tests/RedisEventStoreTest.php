@@ -13,391 +13,418 @@ declare(strict_types=1);
 namespace ProophTest\EventStore\Redis;
 
 use ArrayIterator;
+use Exception;
 use PHPUnit\Framework\TestCase;
-use Prooph\Common\Messaging\NoOpMessageConverter;
+use Prooph\Common\Messaging\FQCNMessageFactory;
+use Prooph\EventStore\EventStore;
+use Prooph\EventStore\Exception\StreamExistsAlready;
+use Prooph\EventStore\Exception\StreamNotFound;
+use Prooph\EventStore\Exception\TransactionAlreadyStarted;
+use Prooph\EventStore\Exception\TransactionNotStarted;
+use Prooph\EventStore\Redis\Exception\RuntimeException;
+use Prooph\EventStore\Redis\PersistenceStrategy;
 use Prooph\EventStore\Redis\RedisEventStore;
 use Prooph\EventStore\Stream;
 use Prooph\EventStore\StreamName;
-use ProophTest\EventStore\Mock\UserCreated;
-use ProophTest\EventStore\Mock\UsernameChanged;
+use Prophecy\Argument;
+use Prophecy\Prophecy\ObjectProphecy;
 use Redis;
 
+/**
+ * @coversDefaultClass \Prooph\EventStore\Redis\RedisEventStore
+ * @group unit
+ */
 final class RedisEventStoreTest extends TestCase
 {
-    /** @var Redis */
+    /** @var ObjectProphecy|Redis */
     private $redisClient;
+
+    /** @var ObjectProphecy|PersistenceStrategy */
+    private $persistenceStrategy;
 
     /** @var RedisEventStore */
     private $eventStore;
 
     protected function setUp(): void
     {
-        $this->redisClient = new Redis();
-        $this->redisClient->connect(getenv('REDIS_HOST'), (int) getenv('REDIS_PORT'));
-        $this->redisClient->setOption(Redis::OPT_PREFIX, 'proophTest:');
+        $this->redisClient = $this->prophesize(Redis::class);
+        $this->persistenceStrategy = $this->prophesize(PersistenceStrategy::class);
 
-        $this->eventStore = new RedisEventStore($this->redisClient);
-    }
-
-    protected function tearDown(): void
-    {
-        $this->redisClient->flushDB();
+        $this->eventStore = new RedisEventStore(
+            $this->redisClient->reveal(),
+            $this->persistenceStrategy->reveal(),
+            new FQCNMessageFactory()
+        );
     }
 
     /**
      * @test
+     * @covers ::__construct
      */
-    public function it_appends_events_to_a_stream(): void
+    public function it_creates_an_event_store_instance(): void
     {
-        $this->eventStore->create($this->getTestStream());
-
-        $streamEvent = UsernameChanged::with(
-            ['name' => 'John Doe'],
-            2
-        );
-
-        $streamEvent = $streamEvent->withAddedMetadata('tag', 'person');
-
-        $this->eventStore->appendTo(new StreamName('Prooph\Model\User'), new ArrayIterator([$streamEvent]));
-
-        $streamEvents = $this->eventStore->load(new StreamName('Prooph\Model\User'));
-
-        $count = 0;
-        $lastEvent = null;
-        foreach ($streamEvents as $event) {
-            $count++;
-            $lastEvent = $event;
-        }
-        $this->assertEquals(2, $count);
-
-        $this->assertInstanceOf(UsernameChanged::class, $lastEvent);
-        $messageConverter = new NoOpMessageConverter();
-
-        $streamEventData = $messageConverter->convertToArray($streamEvent);
-        $lastEventData = $messageConverter->convertToArray($lastEvent);
-
-        $this->assertEquals($streamEventData, $lastEventData);
+        $this->assertInstanceOf(EventStore::class, $this->eventStore);
     }
 
     /**
      * @test
+     * @covers ::fetchStreamMetadata
      */
-    public function it_loads_events_from_position(): void
+    public function it_fetches_stream_metadata(): void
     {
-        $this->eventStore->create($this->getTestStream());
+        $streamName = new StreamName('test');
+        $metadata = ['some' => 'metadata'];
+        $encodedMetadata = json_encode($metadata);
 
-        $streamEvent1 = UsernameChanged::with(
-            ['name' => 'John Doe'],
-            2
-        );
+        $this->persistenceStrategy->getEventStreamHashKey($streamName)->willReturn('test_key')->shouldBeCalled();
+        $this->redisClient->hExists('test_key', 'realStreamName')->willReturn(true)->shouldBeCalled();
+        $this->redisClient->hGet('test_key', 'metadata')->willReturn($encodedMetadata)->shouldBeCalled();
 
-        $streamEvent1 = $streamEvent1->withAddedMetadata('tag', 'person');
+        $result = $this->eventStore->fetchStreamMetadata($streamName);
 
-        $streamEvent2 = UsernameChanged::with(
-            ['name' => 'Jane Doe'],
-            3
-        );
-
-        $streamEvent2 = $streamEvent2->withAddedMetadata('tag', 'person');
-
-        $this->eventStore->appendTo(new StreamName('Prooph\Model\User'), new \ArrayIterator([$streamEvent1, $streamEvent2]));
-
-        $streamEvents = $this->eventStore->load(new StreamName('Prooph\Model\User'), 2);
-
-        $this->assertTrue($streamEvents->valid());
-        $event = $streamEvents->current();
-        $this->assertEquals(0, $streamEvents->key());
-        $this->assertEquals('John Doe', $event->payload()['name']);
-
-        $streamEvents->next();
-        $this->assertTrue($streamEvents->valid());
-        $event = $streamEvents->current();
-        $this->assertEquals(1, $streamEvents->key());
-        $this->assertEquals('Jane Doe', $event->payload()['name']);
-
-        $streamEvents->next();
-        $this->assertFalse($streamEvents->valid());
+        $this->assertEquals($metadata, $result);
     }
 
     /**
      * @test
+     * @covers ::fetchStreamMetadata
      */
-    public function it_appends_events_to_stream_and_records_them(): void
+    public function it_throws_exception_on_metadata_fetch_if_stream_not_exists(): void
     {
-        $this->eventStore->create($this->getTestStream());
+        $this->expectException(StreamNotFound::class);
 
-        $secondStreamEvent = UsernameChanged::with(
-            ['new_name' => 'John Doe'],
-            2
-        );
+        $streamName = new StreamName('test');
 
-        $this->eventStore->appendTo(new StreamName('Prooph\Model\User'), new ArrayIterator([$secondStreamEvent]));
+        $this->persistenceStrategy->getEventStreamHashKey($streamName)->willReturn('test_key');
+        $this->redisClient->hExists('test_key', 'realStreamName')->willReturn(false)->shouldBeCalled();
 
-        $this->assertCount(2, $this->eventStore->load(new StreamName('Prooph\Model\User')));
+        $this->eventStore->fetchStreamMetadata($streamName);
     }
 
     /**
      * @test
+     * @covers ::updateStreamMetadata
+     * @covers ::persistEventStreamMetadata
      */
-    public function it_loads_events_from_number(): void
+    public function it_updates_stream_metadata(): void
     {
-        $stream = $this->getTestStream();
+        $streamName = new StreamName('test');
+        $newMetadata = ['some' => 'metadata'];
+        $streamValues = [
+            'realStreamName' => 'test',
+            'metadata' => json_encode($newMetadata),
+        ];
+
+        $this->persistenceStrategy->getEventStreamHashKey($streamName)->willReturn('test_key');
+        $this->redisClient->hExists('test_key', 'realStreamName')->willReturn(true)->shouldBeCalled();
+        $this->redisClient->hMset('test_key', $streamValues)->willReturn(true)->shouldBeCalled();
+
+        $this->eventStore->updateStreamMetadata($streamName, $newMetadata);
+    }
+
+    /**
+     * @test
+     * @covers ::updateStreamMetadata
+     */
+    public function it_throws_exception_on_metadata_update_if_stream_not_exists(): void
+    {
+        $this->expectException(StreamNotFound::class);
+
+        $streamName = new StreamName('test');
+
+        $this->persistenceStrategy->getEventStreamHashKey($streamName)->willReturn('test_key');
+        $this->redisClient->hExists('test_key', 'realStreamName')->willReturn(false)->shouldBeCalled();
+
+        $this->eventStore->updateStreamMetadata($streamName, []);
+    }
+
+    /**
+     * @test
+     * @covers ::updateStreamMetadata
+     * @covers ::persistEventStreamMetadata
+     */
+    public function it_throws_exception_on_metadata_update_if_persisting_fails(): void
+    {
+        $this->expectException(RuntimeException::class);
+
+        $streamName = new StreamName('test');
+
+        $this->persistenceStrategy->getEventStreamHashKey($streamName)->willReturn('test_key');
+        $this->redisClient->hExists('test_key', 'realStreamName')->willReturn(true)->shouldBeCalled();
+        $this->redisClient->hMset('test_key', Argument::any())->willReturn(false)->shouldBeCalled();
+
+        $this->eventStore->updateStreamMetadata($streamName, []);
+    }
+
+    /**
+     * @test
+     * @covers ::hasStream
+     */
+    public function it_returns_true_if_stream_exists(): void
+    {
+        $streamName = new StreamName('test');
+
+        $this->persistenceStrategy->getEventStreamHashKey($streamName)->willReturn('test_key');
+        $this->redisClient->hExists('test_key', 'realStreamName')->willReturn(true)->shouldBeCalled();
+
+        $result = $this->eventStore->hasStream($streamName);
+
+        $this->assertTrue($result);
+    }
+
+    /**
+     * @test
+     * @covers ::hasStream
+     */
+    public function it_returns_false_if_stream_not_exists(): void
+    {
+        $streamName = new StreamName('test');
+
+        $this->persistenceStrategy->getEventStreamHashKey($streamName)->willReturn('test_key');
+        $this->redisClient->hExists('test_key', 'realStreamName')->willReturn(false)->shouldBeCalled();
+
+        $result = $this->eventStore->hasStream($streamName);
+
+        $this->assertFalse($result);
+    }
+
+    /**
+     * @test
+     * @covers ::create
+     */
+    public function it_persists_stream_metadata_on_create(): void
+    {
+        $streamName = new StreamName('test');
+        $metadata = ['some' => 'metadata'];
+        $events = new ArrayIterator();
+        $stream = new Stream($streamName, $events, $metadata);
+        $streamValues = [
+            'realStreamName' => 'test',
+            'metadata' => json_encode($metadata),
+        ];
+
+        $this->persistenceStrategy->getEventStreamHashKey($streamName)->willReturn('test_key');
+        $this->redisClient->hExists('test_key', 'realStreamName')->willReturn(false)->shouldBeCalled();
+        $this->redisClient->hMset('test_key', $streamValues)->will(function (): bool {
+            $this->hExists('test_key', 'realStreamName')->willReturn(true);
+
+            return true;
+        })->shouldBeCalled();
 
         $this->eventStore->create($stream);
-
-        $streamEventVersion2 = UsernameChanged::with(
-            ['new_name' => 'John Doe'],
-            2
-        );
-
-        $streamEventVersion2 = $streamEventVersion2->withAddedMetadata('snapshot', true);
-
-        $streamEventVersion3 = UsernameChanged::with(
-            ['new_name' => 'Jane Doe'],
-            3
-        );
-
-        $streamEventVersion3 = $streamEventVersion3->withAddedMetadata('snapshot', false);
-
-        $this->eventStore->appendTo($stream->streamName(), new ArrayIterator([$streamEventVersion2, $streamEventVersion3]));
-
-        $loadedEvents = $this->eventStore->load($stream->streamName(), 2);
-
-        $this->assertCount(2, $loadedEvents);
-
-        $loadedEvents->rewind();
-
-        $this->assertTrue($loadedEvents->current()->metadata()['snapshot']);
-        $loadedEvents->next();
-        $this->assertFalse($loadedEvents->current()->metadata()['snapshot']);
-
-        $streamEvents = $this->eventStore->load($stream->streamName(), 2);
-
-        $this->assertCount(2, $streamEvents);
-
-        $streamEvents->rewind();
-
-        $this->assertTrue($streamEvents->current()->metadata()['snapshot']);
-        $streamEvents->next();
-        $this->assertFalse($streamEvents->current()->metadata()['snapshot']);
     }
 
     /**
      * @test
+     * @covers ::create
      */
-    public function it_loads_events_reverse_from_number(): void
+    public function it_throws_exception_on_create_if_stream_already_exists(): void
     {
-        $stream = $this->getTestStream();
+        $this->expectException(StreamExistsAlready::class);
+
+        $streamName = new StreamName('test');
+        $stream = new Stream($streamName, new ArrayIterator());
+
+        $this->persistenceStrategy->getEventStreamHashKey($streamName)->willReturn('test_key');
+        $this->redisClient->hExists('test_key', 'realStreamName')->willReturn(true)->shouldBeCalled();
 
         $this->eventStore->create($stream);
-
-        $streamEventVersion2 = UsernameChanged::with(
-            ['new_name' => 'John Doe'],
-            2
-        );
-
-        $streamEventVersion2 = $streamEventVersion2->withAddedMetadata('snapshot', true);
-
-        $streamEventVersion3 = UsernameChanged::with(
-            ['new_name' => 'Jane Doe'],
-            3
-        );
-
-        $streamEventVersion3 = $streamEventVersion3->withAddedMetadata('snapshot', false);
-
-        $this->eventStore->appendTo($stream->streamName(), new ArrayIterator([$streamEventVersion2, $streamEventVersion3]));
-
-        $loadedEvents = $this->eventStore->loadReverse($stream->streamName(), PHP_INT_MAX, 2);
-
-        $this->assertCount(2, $loadedEvents);
-
-        $loadedEvents->rewind();
-
-        $this->assertFalse($loadedEvents->current()->metadata()['snapshot']);
-        $loadedEvents->next();
-        $this->assertTrue($loadedEvents->current()->metadata()['snapshot']);
-
-        $streamEvents = $this->eventStore->loadReverse($stream->streamName(), PHP_INT_MAX, 2);
-
-        $this->assertCount(2, $streamEvents);
-
-        $streamEvents->rewind();
-
-        $this->assertFalse($streamEvents->current()->metadata()['snapshot']);
-        $streamEvents->next();
-        $this->assertTrue($streamEvents->current()->metadata()['snapshot']);
     }
 
     /**
      * @test
+     * @covers ::updateStreamMetadata
+     * @covers ::persistEventStreamMetadata
      */
-    public function it_loads_events_from_number_with_count(): void
+    public function it_throws_exception_on_create_if_persisting_fails(): void
     {
-        $stream = $this->getTestStream();
+        $this->expectException(RuntimeException::class);
+
+        $streamName = new StreamName('test');
+        $stream = new Stream($streamName, new ArrayIterator());
+
+        $this->persistenceStrategy->getEventStreamHashKey($streamName)->willReturn('test_key');
+        $this->redisClient->hExists('test_key', 'realStreamName')->willReturn(false);
+        $this->redisClient->hMset('test_key', Argument::any())->willReturn(false)->shouldBeCalled();
 
         $this->eventStore->create($stream);
-
-        $streamEventVersion2 = UsernameChanged::with(
-            ['new_name' => 'John Doe'],
-            2
-        );
-
-        $streamEventVersion2 = $streamEventVersion2->withAddedMetadata('snapshot', true);
-
-        $streamEventVersion3 = UsernameChanged::with(
-            ['new_name' => 'Jane Doe'],
-            3
-        );
-
-        $streamEventVersion3 = $streamEventVersion3->withAddedMetadata('snapshot', false);
-
-        $streamEventVersion4 = UsernameChanged::with(
-            ['new_name' => 'Jane Dole'],
-            4
-        );
-
-        $streamEventVersion4 = $streamEventVersion4->withAddedMetadata('snapshot', false);
-
-        $this->eventStore->appendTo($stream->streamName(), new ArrayIterator([
-            $streamEventVersion2,
-            $streamEventVersion3,
-            $streamEventVersion4,
-        ]));
-
-        $loadedEvents = $this->eventStore->load($stream->streamName(), 2, 2);
-
-        $this->assertCount(2, $loadedEvents);
-
-        $loadedEvents->rewind();
-
-        $this->assertTrue($loadedEvents->current()->metadata()['snapshot']);
-        $loadedEvents->next();
-        $this->assertFalse($loadedEvents->current()->metadata()['snapshot']);
-
-        $loadedEvents = $this->eventStore->load($stream->streamName(), 2, 2);
-
-        $this->assertCount(2, $loadedEvents);
-
-        $loadedEvents->rewind();
-
-        $this->assertTrue($loadedEvents->current()->metadata()['snapshot']);
-        $loadedEvents->next();
-        $this->assertFalse($loadedEvents->current()->metadata()['snapshot']);
     }
 
     /**
      * @test
+     * @covers ::beginTransaction
      */
-    public function it_loads_events_reverse_from_number_with_count(): void
+    public function it_begins_transaction(): void
     {
-        $stream = $this->getTestStream();
+        $this->redisClient->multi(Redis::MULTI)->shouldBeCalled();
 
-        $this->eventStore->create($stream);
-
-        $streamEventVersion2 = UsernameChanged::with(
-            ['new_name' => 'John Doe'],
-            2
-        );
-
-        $streamEventVersion2 = $streamEventVersion2->withAddedMetadata('snapshot', true);
-
-        $streamEventVersion3 = UsernameChanged::with(
-            ['new_name' => 'Jane Doe'],
-            3
-        );
-
-        $streamEventVersion3 = $streamEventVersion3->withAddedMetadata('snapshot', false);
-
-        $streamEventVersion4 = UsernameChanged::with(
-            ['new_name' => 'Jane Dole'],
-            4
-        );
-
-        $streamEventVersion4 = $streamEventVersion4->withAddedMetadata('snapshot', false);
-
-        $this->eventStore->appendTo($stream->streamName(), new ArrayIterator([
-            $streamEventVersion2,
-            $streamEventVersion3,
-            $streamEventVersion4,
-        ]));
-
-        $loadedEvents = $this->eventStore->loadReverse($stream->streamName(), 3, 2);
-
-        $this->assertCount(2, $loadedEvents);
-
-        $loadedEvents->rewind();
-
-        $this->assertFalse($loadedEvents->current()->metadata()['snapshot']);
-        $loadedEvents->next();
-        $this->assertTrue($loadedEvents->current()->metadata()['snapshot']);
-
-        $loadedEvents = $this->eventStore->loadReverse($stream->streamName(), 3, 2);
-
-        $this->assertCount(2, $loadedEvents);
-
-        $loadedEvents->rewind();
-
-        $this->assertFalse($loadedEvents->current()->metadata()['snapshot']);
-        $loadedEvents->next();
-        $this->assertTrue($loadedEvents->current()->metadata()['snapshot']);
+        $this->eventStore->beginTransaction();
     }
 
     /**
      * @test
+     * @covers ::beginTransaction
      */
-    public function it_loads_events_in_reverse_order(): void
+    public function it_throws_exception_if_transaction_is_already_started(): void
     {
-        $stream = $this->getTestStream();
+        $this->expectException(TransactionAlreadyStarted::class);
 
-        $this->eventStore->create($stream);
-
-        $streamEventVersion2 = UsernameChanged::with(
-            ['new_name' => 'John Doe'],
-            2
-        );
-
-        $streamEventVersion2 = $streamEventVersion2->withAddedMetadata('snapshot', true);
-
-        $streamEventVersion3 = UsernameChanged::with(
-            ['new_name' => 'Jane Doe'],
-            3
-        );
-
-        $streamEventVersion3 = $streamEventVersion3->withAddedMetadata('snapshot', false);
-
-        $streamEventVersion4 = UsernameChanged::with(
-            ['new_name' => 'Jane Dole'],
-            4
-        );
-
-        $streamEventVersion4 = $streamEventVersion4->withAddedMetadata('snapshot', false);
-
-        $this->eventStore->appendTo($stream->streamName(), new ArrayIterator([
-            $streamEventVersion2,
-            $streamEventVersion3,
-            $streamEventVersion4,
-        ]));
-
-        $loadedEvents = $this->eventStore->loadReverse($stream->streamName(), 3, 2);
-
-        $this->assertCount(2, $loadedEvents);
-
-        $loadedEvents->rewind();
-
-        $this->assertFalse($loadedEvents->current()->metadata()['snapshot']);
-        $loadedEvents->next();
-        $this->assertTrue($loadedEvents->current()->metadata()['snapshot']);
+        $this->eventStore->beginTransaction();
+        $this->eventStore->beginTransaction();
     }
 
-    private function getTestStream(): Stream
+    /**
+     * @test
+     * @covers ::commit
+     */
+    public function it_commits_transaction(): void
     {
-        $streamEvent = UserCreated::with(
-            ['name' => 'Max Mustermann', 'email' => 'contact@prooph.de'],
-            1
-        );
+        $this->redisClient->multi(Redis::MULTI)->willReturn($this->redisClient);
+        $this->redisClient->exec()->shouldBeCalled();
 
-        $streamEvent = $streamEvent->withAddedMetadata('tag', 'person');
+        $this->eventStore->beginTransaction();
+        $this->eventStore->commit();
+    }
 
-        return new Stream(new StreamName('Prooph\Model\User'), new ArrayIterator([$streamEvent]));
+    /**
+     * @test
+     * @covers ::commit
+     */
+    public function it_throws_exception_on_commit_if_transaction_is_not_started(): void
+    {
+        $this->expectException(TransactionNotStarted::class);
+
+        $this->eventStore->commit();
+    }
+
+    /**
+     * @test
+     * @covers ::commit
+     */
+    public function it_throws_exception_on_commit_if_transaction_is_already_committed(): void
+    {
+        $this->expectException(TransactionNotStarted::class);
+
+        $this->redisClient->multi(Redis::MULTI)->willReturn($this->redisClient);
+        $this->redisClient->exec()->shouldBeCalledTimes(1);
+
+        $this->eventStore->beginTransaction();
+        $this->eventStore->commit();
+        $this->eventStore->commit();
+    }
+
+    /**
+     * @test
+     * @covers ::rollback
+     */
+    public function it_rolls_transaction_back(): void
+    {
+        $this->redisClient->multi(Redis::MULTI)->willReturn($this->redisClient);
+        $this->redisClient->discard()->shouldBeCalled();
+
+        $this->eventStore->beginTransaction();
+        $this->eventStore->rollback();
+    }
+
+    /**
+     * @test
+     * @covers ::rollback
+     */
+    public function it_throws_exception_on_rollback_if_transaction_is_not_started(): void
+    {
+        $this->expectException(TransactionNotStarted::class);
+
+        $this->eventStore->rollback();
+    }
+
+    /**
+     * @test
+     * @covers ::rollback
+     */
+    public function it_throws_exception_on_rollback_if_transaction_is_already_rolled_back(): void
+    {
+        $this->expectException(TransactionNotStarted::class);
+
+        $this->redisClient->multi(Redis::MULTI)->willReturn($this->redisClient);
+        $this->redisClient->discard()->shouldBeCalledTimes(1);
+
+        $this->eventStore->beginTransaction();
+        $this->eventStore->rollback();
+        $this->eventStore->rollback();
+    }
+
+    /**
+     * @test
+     * @covers ::inTransaction
+     */
+    public function it_returns_true_if_in_transaction(): void
+    {
+        $this->eventStore->beginTransaction();
+
+        $result = $this->eventStore->inTransaction();
+
+        $this->assertTrue($result);
+    }
+
+    /**
+     * @test
+     * @covers ::inTransaction
+     */
+    public function it_returns_false_if_not_in_transaction(): void
+    {
+        $this->redisClient->multi(Redis::MULTI)->willReturn($this->redisClient);
+
+        $this->assertFalse($this->eventStore->inTransaction());
+
+        $this->redisClient->discard()->shouldBeCalled();
+        $this->eventStore->beginTransaction();
+        $this->eventStore->rollback();
+
+        $this->assertFalse($this->eventStore->inTransaction());
+
+        $this->redisClient->exec()->shouldBeCalled();
+        $this->eventStore->beginTransaction();
+        $this->eventStore->commit();
+
+        $this->assertFalse($this->eventStore->inTransaction());
+    }
+
+    /**
+     * @test
+     * @covers ::transactional
+     */
+    public function it_executes_callable_transactional(): void
+    {
+        $callable = function ($eventStore) use (&$providedEventStore): string {
+            $providedEventStore = $eventStore;
+
+            return 'test_response';
+        };
+
+        $this->redisClient->multi(Redis::MULTI)->willReturn($this->redisClient);
+        $this->redisClient->exec()->shouldBeCalled();
+
+        $response = $this->eventStore->transactional($callable);
+
+        $this->assertEquals($this->eventStore, $providedEventStore);
+        $this->assertEquals('test_response', $response);
+    }
+
+    /**
+     * @test
+     * @covers ::transactional
+     */
+    public function it_rolls_back_if_transactional_exception_is_thrown(): void
+    {
+        $this->expectException(Exception::class);
+
+        $callable = function (): void {
+            throw new Exception();
+        };
+
+        $this->redisClient->multi(Redis::MULTI)->willReturn($this->redisClient);
+        $this->redisClient->discard()->shouldBeCalled();
+
+        $this->eventStore->transactional($callable);
     }
 }
