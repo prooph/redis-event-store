@@ -13,7 +13,7 @@ declare(strict_types=1);
 namespace Prooph\EventStore\Redis;
 
 use Iterator;
-use Prooph\Common\Messaging\FQCNMessageFactory;
+use Prooph\Common\Messaging\MessageFactory;
 use Prooph\EventStore\Exception\StreamExistsAlready;
 use Prooph\EventStore\Exception\StreamNotFound;
 use Prooph\EventStore\Exception\TransactionAlreadyStarted;
@@ -35,17 +35,24 @@ use Redis;
 
 final class RedisEventStore implements TransactionalEventStore
 {
+    private const HASH_FIELD_REAL_STREAM_NAME = 'realStreamName';
+    private const HASH_FIELD_METADATA = 'metadata';
+
     private $redisClient;
-    private $inTransaction;
+    private $persistenceStrategy;
     private $messageFactory;
+    private $inTransaction;
 
-    public function __construct(Redis $redisClient)
-    {
+    public function __construct(
+        Redis $redisClient,
+        PersistenceStrategy $persistenceStrategy,
+        MessageFactory $messageFactory
+    ) {
         $this->redisClient = $redisClient;
-        $this->inTransaction = false;
+        $this->persistenceStrategy = $persistenceStrategy;
+        $this->messageFactory = $messageFactory;
 
-        // todo: inject message factory
-        $this->messageFactory = new FQCNMessageFactory();
+        $this->inTransaction = false;
     }
 
     public function fetchStreamMetadata(StreamName $streamName): array
@@ -54,12 +61,10 @@ final class RedisEventStore implements TransactionalEventStore
             throw StreamNotFound::with($streamName);
         }
 
-        $streamNameKey = $this->getKeyFromStreamName($streamName);
-        $hashKey = sprintf('%s:{%s}', 'event_streams', $streamNameKey); // todo: inject event_streams key in constructor
+        $hashKey = $this->persistenceStrategy->getEventStreamHashKey($streamName);
+        $metadata = $this->redisClient->hGet($hashKey, self::HASH_FIELD_METADATA);
 
-        $metadata = $this->redisClient->hGet($hashKey, 'metadata');
-
-        return json_decode($metadata);
+        return json_decode($metadata, true);
     }
 
     public function updateStreamMetadata(StreamName $streamName, array $newMetadata): void
@@ -68,32 +73,24 @@ final class RedisEventStore implements TransactionalEventStore
             throw StreamNotFound::with($streamName);
         }
 
-        $streamNameKey = $this->getKeyFromStreamName($streamName);
-        $hashKey = sprintf('%s:{%s}', 'event_streams', $streamNameKey); // todo: inject event_streams key in constructor
-
-        $result = $this->redisClient->hMset($hashKey, [
-            'realStreamName' => $streamName->toString(),
-            'metadata' => json_encode($newMetadata), // todo: is it already encoded?
-        ]);
-
-        if (! $result) {
-            throw new RuntimeException(); // todo: provide exception message
-        }
+        $this->persistEventStreamMetadata($streamName, $newMetadata);
     }
 
     public function hasStream(StreamName $streamName): bool
     {
-        $streamNameKey = $this->getKeyFromStreamName($streamName);
-        $hashKey = sprintf('%s:{%s}', 'event_streams', $streamNameKey); // todo: inject event_streams key in constructor
+        $hashKey = $this->persistenceStrategy->getEventStreamHashKey($streamName);
+        $this->watchKey($hashKey);
 
-        $this->redisClient->watch($hashKey);
-
-        return $this->redisClient->hExists($hashKey, 'realStreamName');
+        return $this->redisClient->hExists($hashKey, self::HASH_FIELD_REAL_STREAM_NAME);
     }
 
     public function create(Stream $stream): void
     {
-        $this->addStreamToStreamsHash($stream);
+        if ($this->hasStream($stream->streamName())) {
+            throw StreamExistsAlready::with($stream->streamName());
+        }
+
+        $this->persistEventStreamMetadata($stream->streamName(), $stream->metadata());
         $this->appendTo($stream->streamName(), $stream->streamEvents());
     }
 
@@ -103,17 +100,17 @@ final class RedisEventStore implements TransactionalEventStore
             throw StreamNotFound::with($streamName);
         }
 
-        $streamNameKey = $this->getKeyFromStreamName($streamName);
+        $streamNameKey = $this->persistenceStrategy->getEventStreamHashKey($streamName); // fixme
 
         // todo: use persistence strategy
         foreach ($streamEvents as $event) {
             $eventId = $event->uuid()->toString();
             $aggregateVersion = $event->metadata()['_aggregate_version'];
 
-            $storageKey = 'event_data:'.$streamNameKey.':'.$eventId;
+            $storageKey = 'event_data:' . $streamNameKey . ':' . $eventId;
 
             // todo: throw exception if version for aggregate is already set (persistence strategy)
-            $this->redisClient->zAdd('event_version:'.$streamNameKey, $aggregateVersion, $storageKey);
+            $this->redisClient->zAdd('event_version:' . $streamNameKey, $aggregateVersion, $storageKey);
 
             // todo: maybe we using a hash here?
             $this->redisClient->set($storageKey, json_encode([
@@ -135,14 +132,14 @@ final class RedisEventStore implements TransactionalEventStore
         int $count = null,
         MetadataMatcher $metadataMatcher = null
     ): Iterator {
-        $streamNameKey = $this->getKeyFromStreamName($streamName);
+        $streamNameKey = $this->persistenceStrategy->getEventStreamHashKey($streamName); // fixme
         $result = new \ArrayIterator();
 
         $fromNumber--;
         $toNumber = $count ? $fromNumber + $count : -1;
 
         // todo: is $fromNumber = 1 the aggregate version = 1 or the first event?
-        $eventDataKeys = $this->redisClient->zRange('event_version:'.$streamNameKey, $fromNumber, $toNumber);
+        $eventDataKeys = $this->redisClient->zRange('event_version:' . $streamNameKey, $fromNumber, $toNumber);
 
         if (! $eventDataKeys) {
             return $result;
@@ -177,15 +174,14 @@ final class RedisEventStore implements TransactionalEventStore
         int $count = null,
         MetadataMatcher $metadataMatcher = null
     ): Iterator {
-        $streamNameKey = $this->getKeyFromStreamName($streamName);
-
+        $streamNameKey = $this->persistenceStrategy->getEventStreamHashKey($streamName); // fixme
         $result = new \ArrayIterator();
 
         $fromNumber = -1 * $fromNumber;
         $toNumber = $count ? $fromNumber - $count : 0;
 
         // todo: is $fromNumber = 1 the aggregate version = 1 or the first event?
-        $eventDataKeys = $this->redisClient->zRevRange('event_version:'.$streamNameKey, $fromNumber, $toNumber);
+        $eventDataKeys = $this->redisClient->zRevRange('event_version:' . $streamNameKey, $fromNumber, (int) $toNumber);
 
         if (! $eventDataKeys) {
             return $result;
@@ -306,31 +302,24 @@ final class RedisEventStore implements TransactionalEventStore
         return $result ?: true;
     }
 
-    /**
-     * Maybe we´re using two hashes instead of a multi hash here?
-     */
-    private function addStreamToStreamsHash(Stream $stream): void
+    private function watchKey(string $key)
     {
-        if ($this->hasStream($stream->streamName())) {
-            throw StreamExistsAlready::with($stream->streamName());
+        if ($this->inTransaction()) {
+            $this->redisClient->watch($key);
         }
+    }
 
-        $streamNameKey = $this->getKeyFromStreamName($stream->streamName());
-        $hashKey = sprintf('%s:{%s}', 'event_streams', $streamNameKey); // todo: inject event_streams key in constructor
+    private function persistEventStreamMetadata(StreamName $streamName, array $metadata): void
+    {
+        $hashKey = $this->persistenceStrategy->getEventStreamHashKey($streamName);
 
         $result = $this->redisClient->hMset($hashKey, [
-            'realStreamName' => $stream->streamName()->toString(),
-            'metadata' => json_encode($stream->metadata()), // todo: is it already encoded?
+            self::HASH_FIELD_REAL_STREAM_NAME => $streamName->toString(),
+            self::HASH_FIELD_METADATA => json_encode($metadata), // todo: is it already encoded?
         ]);
 
         if (! $result) {
             throw new RuntimeException(); // todo: provide exception message
         }
-    }
-
-    private function getKeyFromStreamName(StreamName $streamName): string
-    {
-        // todo: implement this method in persistence strategy
-        return sha1($streamName->toString());
     }
 }
