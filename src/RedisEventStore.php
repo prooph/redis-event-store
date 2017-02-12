@@ -252,7 +252,6 @@ final class RedisEventStore implements TransactionalEventStore
         throw new RuntimeException('not implemented yet');
     }
 
-
     public function deleteProjection(string $name, bool $deleteEmittedEvents): void
     {
         throw new RuntimeException('not implemented yet');
