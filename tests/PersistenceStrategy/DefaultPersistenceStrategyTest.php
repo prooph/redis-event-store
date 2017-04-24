@@ -10,18 +10,19 @@
 
 declare(strict_types=1);
 
-namespace ProophTest\EventStore\Redis;
+namespace ProophTest\EventStore\Redis\PersistenceStrategy;
 
 use Prooph\EventStore\Redis\PersistenceStrategy;
+use Prooph\EventStore\Redis\PersistenceStrategy\DefaultPersistenceStrategy;
+use ProophTest\EventStore\Redis\PersistenceStrategyIntegrationTestCase;
 
 /**
- * @group integration
- * @coversNothing
+ * @covers \Prooph\EventStore\Redis\PersistenceStrategy\DefaultPersistenceStrategy
  */
-final class DefaultPersistenceIntegrationTest extends PersistenceStrategyIntegrationTestCase
+final class DefaultPersistenceStrategyTest extends PersistenceStrategyIntegrationTestCase
 {
     protected function getPersistenceStrategy(): PersistenceStrategy
     {
-        return new PersistenceStrategy\DefaultPersistenceStrategy();
+        return new DefaultPersistenceStrategy();
     }
 }

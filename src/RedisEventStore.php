@@ -19,14 +19,6 @@ use Prooph\EventStore\Exception\StreamNotFound;
 use Prooph\EventStore\Exception\TransactionAlreadyStarted;
 use Prooph\EventStore\Exception\TransactionNotStarted;
 use Prooph\EventStore\Metadata\MetadataMatcher;
-use Prooph\EventStore\Projection\Projection;
-use Prooph\EventStore\Projection\ProjectionFactory;
-use Prooph\EventStore\Projection\ProjectionOptions;
-use Prooph\EventStore\Projection\Query;
-use Prooph\EventStore\Projection\QueryFactory;
-use Prooph\EventStore\Projection\ReadModel;
-use Prooph\EventStore\Projection\ReadModelProjection;
-use Prooph\EventStore\Projection\ReadModelProjectionFactory;
 use Prooph\EventStore\Redis\Exception\RuntimeException;
 use Prooph\EventStore\Stream;
 use Prooph\EventStore\StreamName;
@@ -53,179 +45,6 @@ final class RedisEventStore implements TransactionalEventStore
         $this->messageFactory = $messageFactory;
 
         $this->inTransaction = false;
-    }
-
-    public function fetchStreamMetadata(StreamName $streamName): array
-    {
-        if (! $this->hasStream($streamName)) {
-            throw StreamNotFound::with($streamName);
-        }
-
-        $hashKey = $this->persistenceStrategy->getEventStreamHashKey($streamName);
-        $metadata = $this->redisClient->hGet($hashKey, self::HASH_FIELD_METADATA);
-
-        return json_decode($metadata, true);
-    }
-
-    public function updateStreamMetadata(StreamName $streamName, array $newMetadata): void
-    {
-        if (! $this->hasStream($streamName)) {
-            throw StreamNotFound::with($streamName);
-        }
-
-        $this->persistEventStreamMetadata($streamName, $newMetadata);
-    }
-
-    public function hasStream(StreamName $streamName): bool
-    {
-        $hashKey = $this->persistenceStrategy->getEventStreamHashKey($streamName);
-        $this->watchKey($hashKey);
-
-        return $this->redisClient->hExists($hashKey, self::HASH_FIELD_REAL_STREAM_NAME);
-    }
-
-    public function create(Stream $stream): void
-    {
-        if ($this->hasStream($stream->streamName())) {
-            throw StreamExistsAlready::with($stream->streamName());
-        }
-
-        $this->persistEventStreamMetadata($stream->streamName(), $stream->metadata());
-        $this->appendTo($stream->streamName(), $stream->streamEvents());
-    }
-
-    public function appendTo(StreamName $streamName, Iterator $streamEvents): void
-    {
-        if (! $this->hasStream($streamName)) {
-            throw StreamNotFound::with($streamName);
-        }
-
-        $streamNameKey = $this->persistenceStrategy->getEventStreamHashKey($streamName); // fixme
-
-        // todo: use persistence strategy
-        foreach ($streamEvents as $event) {
-            $eventId = $event->uuid()->toString();
-            $aggregateVersion = $event->metadata()['_aggregate_version'];
-
-            $storageKey = 'event_data:' . $streamNameKey . ':' . $eventId;
-
-            // todo: throw exception if version for aggregate is already set (persistence strategy)
-            $this->redisClient->zAdd('event_version:' . $streamNameKey, $aggregateVersion, $storageKey);
-
-            // todo: maybe we using a hash here?
-            $this->redisClient->set($storageKey, json_encode([
-                'event_id' => $event->uuid()->toString(),
-                'event_name' => $event->messageName(),
-                'payload' => json_encode($event->payload()),
-                'metadata' => json_encode($event->metadata()),
-                'created_at' => $event->createdAt()->format('Y-m-d\TH:i:s.u'),
-            ]));
-
-            // todo: maybe for later usage with metadata matcher
-            //$this->redisClient->hMset('event_metadata:'.$streamNameKey.':'.$eventId, $event->metadata());
-        }
-    }
-
-    public function load(
-        StreamName $streamName,
-        int $fromNumber = 1,
-        int $count = null,
-        MetadataMatcher $metadataMatcher = null
-    ): Iterator {
-        $streamNameKey = $this->persistenceStrategy->getEventStreamHashKey($streamName); // fixme
-
-        $fromNumber--;
-        $toNumber = $count ? $fromNumber + $count - 1 : -1;
-
-        $eventDataKeys = $this->redisClient->zRange('event_version:' . $streamNameKey, $fromNumber, $toNumber);
-
-        if (! $eventDataKeys) {
-            return;
-        }
-
-        // todo: use persistence strategy
-        foreach ($this->redisClient->mget($eventDataKeys) as $eventKey => $eventData) {
-            if (false === $eventData) {
-                throw new RuntimeException(); // todo: provide excepion message
-            }
-
-            $eventData = json_decode($eventData, true);
-
-            yield $this->messageFactory->createMessageFromArray($eventData['event_name'], [
-                'uuid' => $eventData['event_id'],
-                'created_at' => \DateTimeImmutable::createFromFormat('Y-m-d\TH:i:s.u', $eventData['created_at']),
-                'payload' => json_decode($eventData['payload'], true),
-                'metadata' => json_decode($eventData['metadata'], true),
-            ]);
-        }
-
-        // todo: implement metadata matcher
-    }
-
-    public function loadReverse(
-        StreamName $streamName,
-        int $fromNumber = PHP_INT_MAX,
-        int $count = null,
-        MetadataMatcher $metadataMatcher = null
-    ): Iterator {
-        throw new RuntimeException('not implemented yet');
-    }
-
-    public function delete(StreamName $streamName): void
-    {
-        throw new RuntimeException('not implemented yet');
-    }
-
-    public function createQuery(QueryFactory $factory = null): Query
-    {
-        throw new RuntimeException('not implemented yet');
-    }
-
-    public function createProjection(
-        string $name,
-        ProjectionOptions $options = null,
-        ProjectionFactory $factory = null
-    ): Projection {
-        throw new RuntimeException('not implemented yet');
-    }
-
-    public function createReadModelProjection(
-        string $name,
-        ReadModel $readModel,
-        ProjectionOptions $options = null,
-        ReadModelProjectionFactory $factory = null
-    ): ReadModelProjection {
-        throw new RuntimeException('not implemented yet');
-    }
-
-    public function getDefaultQueryFactory(): QueryFactory
-    {
-        throw new RuntimeException('not implemented yet');
-    }
-
-    public function getDefaultProjectionFactory(): ProjectionFactory
-    {
-        throw new RuntimeException('not implemented yet');
-    }
-
-    public function getDefaultReadModelProjectionFactory(): ReadModelProjectionFactory
-    {
-        throw new RuntimeException('not implemented yet');
-    }
-
-    public function deleteProjection(string $name, bool $deleteEmittedEvents): void
-    {
-        throw new RuntimeException('not implemented yet');
-    }
-
-    public function resetProjection(string $name): void
-    {
-        throw new RuntimeException('not implemented yet');
-    }
-
-    public function stopProjection(string $name): void
-    {
-        throw new RuntimeException('not implemented yet');
     }
 
     public function beginTransaction(): void
@@ -270,12 +89,164 @@ final class RedisEventStore implements TransactionalEventStore
         try {
             $result = $callable($this);
             $this->commit();
-        } catch (\Exception $e) {
+        } catch (\Throwable $exception) {
             $this->rollback();
-            throw $e;
+            throw $exception;
         }
 
         return $result ?: true;
+    }
+    public function updateStreamMetadata(StreamName $streamName, array $newMetadata): void
+    {
+        if (! $this->hasStream($streamName)) {
+            throw StreamNotFound::with($streamName);
+        }
+
+        $this->persistEventStreamMetadata($streamName, $newMetadata);
+    }
+
+    public function create(Stream $stream): void
+    {
+        if ($this->hasStream($stream->streamName())) {
+            throw StreamExistsAlready::with($stream->streamName());
+        }
+
+        $this->persistEventStreamMetadata($stream->streamName(), $stream->metadata());
+        $this->appendTo($stream->streamName(), $stream->streamEvents());
+    }
+
+    public function appendTo(StreamName $streamName, Iterator $streamEvents): void
+    {
+        if (! $this->hasStream($streamName)) {
+            throw StreamNotFound::with($streamName);
+        }
+
+        $streamNameKey = $this->persistenceStrategy->getEventStreamHashKey($streamName); // fixme
+
+        // todo: use persistence strategy
+        foreach ($streamEvents as $event) {
+            $eventId = $event->uuid()->toString();
+            $aggregateVersion = $event->metadata()['_aggregate_version'];
+
+            $storageKey = 'event_data:' . $streamNameKey . ':' . $eventId;
+
+            // todo: throw exception if version for aggregate is already set (persistence strategy)
+            $this->redisClient->zAdd('event_version:' . $streamNameKey, $aggregateVersion, $storageKey);
+
+            // todo: maybe we using a hash here?
+            $this->redisClient->set($storageKey, json_encode([
+                'event_id' => $event->uuid()->toString(),
+                'event_name' => $event->messageName(),
+                'payload' => json_encode($event->payload()),
+                'metadata' => json_encode($event->metadata()),
+                'created_at' => $event->createdAt()->format('Y-m-d\TH:i:s.u'),
+            ]));
+
+            // todo: maybe for later usage with metadata matcher
+            //$this->redisClient->hMset('event_metadata:'.$streamNameKey.':'.$eventId, $event->metadata());
+        }
+    }
+
+    public function delete(StreamName $streamName): void
+    {
+        throw new RuntimeException('not implemented yet');
+    }
+
+    public function fetchStreamMetadata(StreamName $streamName): array
+    {
+        if (! $this->hasStream($streamName)) {
+            throw StreamNotFound::with($streamName);
+        }
+
+        $hashKey = $this->persistenceStrategy->getEventStreamHashKey($streamName);
+        $metadata = $this->redisClient->hGet($hashKey, self::HASH_FIELD_METADATA);
+
+        return json_decode($metadata, true);
+    }
+
+    public function hasStream(StreamName $streamName): bool
+    {
+        $hashKey = $this->persistenceStrategy->getEventStreamHashKey($streamName);
+        $this->watchKey($hashKey);
+
+        return $this->redisClient->hExists($hashKey, self::HASH_FIELD_REAL_STREAM_NAME);
+    }
+
+    public function load(
+        StreamName $streamName,
+        int $fromNumber = 1,
+        int $count = null,
+        MetadataMatcher $metadataMatcher = null
+    ): Iterator {
+        $streamNameKey = $this->persistenceStrategy->getEventStreamHashKey($streamName); // fixme
+
+        $fromNumber--;
+        $toNumber = $count ? $fromNumber + $count - 1 : -1;
+
+        $eventDataKeys = $this->redisClient->zRange('event_version:' . $streamNameKey, $fromNumber, $toNumber);
+
+        if (! $eventDataKeys) {
+            return;
+        }
+
+        // todo: use persistence strategy
+        foreach ($this->redisClient->mget($eventDataKeys) as $eventKey => $eventData) {
+            if (false === $eventData) {
+                throw new RuntimeException(); // todo: provide excepion message
+            }
+
+            $eventData = json_decode($eventData, true);
+
+            yield $this->messageFactory->createMessageFromArray($eventData['event_name'], [
+                'uuid' => $eventData['event_id'],
+                'created_at' => \DateTimeImmutable::createFromFormat('Y-m-d\TH:i:s.u', $eventData['created_at']),
+                'payload' => json_decode($eventData['payload'], true),
+                'metadata' => json_decode($eventData['metadata'], true),
+            ]);
+        }
+
+        // todo: implement metadata matcher
+    }
+
+    public function loadReverse(
+        StreamName $streamName,
+        int $fromNumber = null,
+        int $count = null,
+        MetadataMatcher $metadataMatcher = null
+    ): Iterator {
+        throw new RuntimeException('not implemented yet');
+    }
+
+    public function fetchStreamNames(
+        ?string $filter,
+        ?MetadataMatcher $metadataMatcher,
+        int $limit = 20,
+        int $offset = 0
+    ): array {
+        // TODO: Implement fetchStreamNames() method.
+        throw new RuntimeException('not implemented yet');
+    }
+
+    public function fetchStreamNamesRegex(
+        string $filter,
+        ?MetadataMatcher $metadataMatcher,
+        int $limit = 20,
+        int $offset = 0
+    ): array {
+        // TODO: Implement fetchStreamNamesRegex() method.
+        throw new RuntimeException('not implemented yet');
+    }
+
+    public function fetchCategoryNames(?string $filter, int $limit = 20, int $offset = 0): array
+    {
+        // TODO: Implement fetchCategoryNames() method.
+        throw new RuntimeException('not implemented yet');
+    }
+
+    public function fetchCategoryNamesRegex(string $filter, int $limit = 20, int $offset = 0): array
+    {
+        // TODO: Implement fetchCategoryNamesRegex() method.
+        throw new RuntimeException('not implemented yet');
     }
 
     private function watchKey(string $key)
