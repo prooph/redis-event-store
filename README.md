@@ -13,4 +13,4 @@ Redis Adapter for ProophEventStore http://getprooph.org
 `$ composer tests`
 
 ##### with Docker
-`$ docker-compose -f docker-compose-tests.yml run -e REDIS_HOST=redis --rm composer run-script tests --timeout 0`
+`$ docker-compose -f docker-compose-tests.yml run tests`
