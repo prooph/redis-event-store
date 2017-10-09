@@ -1,0 +1,15 @@
+version: '2'
+services:
+
+  tests:
+    image: prooph/php:7.1-cli
+    command: /app/vendor/bin/phpunit
+    volumes:
+      - .:/app
+    links:
+      - redis:redis
+    environment:
+      - REDIS_HOST=redis
+
+  redis:
+    image: redis:3.2-alpine
